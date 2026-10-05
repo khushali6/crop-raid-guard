@@ -1,0 +1,17 @@
+.DS_Store
+.backup/
+.env
+.env.*
+!.env.example
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+
+# Supabase CLI state
+supabase/.branches/
+supabase/.temp/
