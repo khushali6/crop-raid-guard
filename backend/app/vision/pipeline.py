@@ -65,6 +65,31 @@ def _animal_conf(pred: FramePrediction, threshold: float) -> float:
     return max((d.conf for d in pred.detections if d.label == "animal" and d.conf >= threshold), default=0.0)
 
 
+def _detect_adaptive(backend, selected: list[media.Frame], stride: int, threshold: float, on_batch,
+                     batch: int = 12) -> dict[int, FramePrediction]:
+    """Detect on every `stride`-th sampled frame, then fill in the skipped frames only where the
+    coarse pass changes between "something there" and "nothing there" (arrivals and departures)."""
+    predictions: dict[int, FramePrediction] = {}
+    coarse = sorted({*range(0, len(selected), stride), len(selected) - 1})
+    total = len(coarse)
+
+    def run(positions: list[int]) -> None:
+        for start in range(0, len(positions), batch):
+            chunk = [selected[p] for p in positions[start : start + batch]]
+            for fr, pred in zip(chunk, backend.detect([f.path for f in chunk]), strict=True):
+                predictions[fr.index] = pred
+            on_batch(len(predictions), total)
+
+    def occupied(pos: int) -> bool:
+        return any(d.conf >= threshold for d in predictions[selected[pos].index].detections)
+
+    run(coarse)
+    fill = [p for a, b in zip(coarse[:-1], coarse[1:], strict=True) if occupied(a) != occupied(b) for p in range(a + 1, b)]
+    total += len(fill)
+    run(fill)
+    return predictions
+
+
 def _classify_key_frames(backend, selected: list[media.Frame], predictions: dict[int, FramePrediction], limit: int) -> None:
     """Classify the most confident animal frame from up to `limit` evenly sized time slices,
     then give every other animal frame the species of its nearest classified neighbour."""
@@ -96,26 +121,21 @@ def _run_vision(video_path: Path, work: Path, on_batch) -> Analysis:
     selected = media.select_frames(frames, s.motion_threshold, s.keepalive_every_s, s.max_frames)
     backend = get_backend(s.vision_backend, s.speciesnet_model, s.detector_img_size)
 
-    predictions: dict[int, FramePrediction] = {}
-    batch = 12
-    for start in range(0, len(selected), batch):
-        chunk = selected[start : start + batch]
-        for fr, pred in zip(chunk, backend.detect([f.path for f in chunk]), strict=True):
-            predictions[fr.index] = pred
-        on_batch(min(start + batch, len(selected)), len(selected))
-    _classify_key_frames(backend, selected, predictions, s.max_classify_frames)
+    predictions = _detect_adaptive(backend, selected, max(s.detect_stride, 1), s.detection_threshold, on_batch)
+    analyzed = [f for f in selected if f.index in predictions]
+    _classify_key_frames(backend, analyzed, predictions, s.max_classify_frames)
 
     tracker = IoUTracker()
     tracked: list[TrackedDetection] = []
     people: list[TrackedDetection] = []
-    for fr in selected:
+    for fr in analyzed:
         pred = predictions[fr.index]
         dets = [(d.label, d.conf, d.bbox) for d in pred.detections if d.conf >= s.detection_threshold]
         for td in tracker.update(fr.t, fr.index, dets):
             td.species_label, td.species_score = pred.species_label, pred.species_score
             (people if td.label == "human" else tracked).append(td)
     events = group_events(tracked, s.event_gap_s, _label_key, people)
-    return Analysis(meta, len(frames), len(selected), predictions, {f.index: f.path for f in frames}, events,
+    return Analysis(meta, len(frames), len(analyzed), predictions, {f.index: f.path for f in frames}, events,
                     backend.name, backend.version)
 
 

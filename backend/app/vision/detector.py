@@ -57,7 +57,7 @@ class SpeciesNetBackend:
     _parts = None
     _warm = False
 
-    def __init__(self, model_name: str, detector_size: int = 640, classifier_batch: int = 8):
+    def __init__(self, model_name: str, detector_size: int = 512, classifier_batch: int = 8):
         self.model_name = model_name
         self.detector_size = detector_size
         self.classifier_batch = classifier_batch
@@ -171,7 +171,7 @@ class MockBackend:
         return None
 
 
-def get_backend(name: str, model_name: str, detector_size: int = 640) -> VisionBackend:
+def get_backend(name: str, model_name: str, detector_size: int = 512) -> VisionBackend:
     if name == "mock":
         return MockBackend()
     return SpeciesNetBackend(model_name, detector_size)

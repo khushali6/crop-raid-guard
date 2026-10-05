@@ -261,3 +261,29 @@ def test_classify_key_frames_limits_classifier_and_propagates_labels():
     assert len(fake.calls) == 4
     assert all(preds[i].species_label == "boar" for i in range(5, 35))
     assert all(preds[i].species_label is None for i in [*range(5), *range(35, 40)])
+
+
+def test_detect_adaptive_only_fills_arrivals_and_departures():
+    from pathlib import Path
+
+    from app.vision.detector import Detection, FramePrediction
+    from app.vision.media import Frame
+    from app.vision.pipeline import _detect_adaptive
+
+    frames = [Frame(i, float(i), Path(f"f{i}.jpg")) for i in range(20)]
+    seen: list[int] = []
+
+    class Fake:
+        def detect(self, paths):
+            out = []
+            for p in paths:
+                i = int(p.stem[1:])
+                seen.append(i)
+                out.append(FramePrediction(p, [Detection("animal", 0.9, (0.1, 0.1, 0.2, 0.2))] if 7 <= i <= 12 else []))
+            return out
+
+    preds = _detect_adaptive(Fake(), frames, 2, 0.2, lambda done, total: None)
+    assert set(preds) == set(seen)
+    assert {7, 13} <= set(seen)  # arrival and departure frames are detected
+    assert not {1, 3, 9, 11, 15, 17} & set(seen)  # quiet and steady stretches are skipped
+    assert 19 in seen

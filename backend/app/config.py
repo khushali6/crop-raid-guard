@@ -47,12 +47,14 @@ class Settings(BaseSettings):
     admin1_region: str | None = None
     sample_fps: float = 1.0
     max_frames: int = 360
-    # MegaDetector letterbox size: 640 is ~4x faster than the stock 1280 on CPU with near-identical
-    # confidence for animals that fill a reasonable part of a farm camera frame.
-    detector_img_size: int = 640
+    # MegaDetector letterbox size (multiple of 64): 512 is ~6x faster than the stock 1280 on CPU with
+    # near-identical confidence for animals that fill a reasonable part of a farm camera frame.
+    detector_img_size: int = 512
+    # Detect on every Nth sampled frame first; skipped frames are only run at arrivals/departures.
+    detect_stride: int = 2
     # Species classification runs on at most this many key frames per video; other frames inherit
     # the label of the nearest classified frame.
-    max_classify_frames: int = 16
+    max_classify_frames: int = 8
     vision_warmup: bool = True
     motion_threshold: float = 0.3
     keepalive_every_s: float = 10.0
