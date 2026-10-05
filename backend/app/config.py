@@ -20,8 +20,8 @@ class Settings(BaseSettings):
 
     # LLM (Gemini free tier by default)
     gemini_api_key: str = ""
-    llm_model: str = "gemini-2.5-flash"
-    llm_router_model: str = "gemini-2.5-flash-lite"
+    llm_model: str = "gemini-flash-latest"
+    llm_router_model: str = "gemini-flash-lite-latest"
     embed_model: str = "gemini-embedding-001"
     embed_dim: int = 768
     # Paid-equivalent prices (USD per 1M tokens) used to report cost per run; the free tier bills $0.
