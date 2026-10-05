@@ -5,7 +5,7 @@ Night camera footage in, signed crop-loss evidence out. Farmers upload field-cam
 | Folder | What it is | Free host |
 | --- | --- | --- |
 | `crop-raid-guard-ui/` | TanStack Start web app | Vercel (Hobby) |
-| `backend/` | FastAPI API, vision worker, agents, MCP server | Hugging Face Spaces (Docker, CPU basic) |
+| `backend/` | FastAPI API, vision worker, agents, MCP server | Oracle Cloud Always Free VM (Docker + Caddy) |
 | `supabase/` | Postgres schema, RLS, RPCs, storage buckets | Supabase (Free) |
 
 Gemini (free tier from Google AI Studio) powers chat, semantic search and translated claim drafts. It is optional.
@@ -24,23 +24,26 @@ In the dashboard, under **Authentication → URL configuration**, set the site U
 
 Note these values from **Project settings**: the project URL, the publishable key, the service-role key, the JWT secret (or leave it empty to use JWKS), and the session-pooler connection string (port 5432).
 
-### 2. API on Hugging Face Spaces
+### 2. API on an Oracle Cloud Always Free VM
 
-Create a Space with the **Docker** SDK and push the contents of `backend/` to it. The README front matter already sets `app_port: 7860`.
+SpeciesNet needs about 2 GB of RAM and the worker must stay on, which rules out most free container hosts. Oracle's Always Free Ampere A1 shape (up to 4 cores, 24 GB) fits comfortably.
+
+1. Create an Ubuntu 24.04 instance (shape `VM.Standard.A1.Flex`) and add your SSH public key.
+2. In the instance's VCN security list, allow ingress TCP 80 and 443 from `0.0.0.0/0`.
+3. Copy the repository to the VM and write `/opt/crg/api.env` (see `backend/.env.example`):
+   - `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, `DATABASE_URL` (session pooler, port 5432)
+   - `SUPABASE_JWT_SECRET` only if your project still signs with HS256
+   - `EVIDENCE_SIGNING_KEY` from `python -m app.evidence keygen`
+   - `GEMINI_API_KEY` (optional)
+   - `PUBLIC_API_URL=https://A-B-C-D.sslip.io` (your IP with dashes), and `FRONTEND_URL` / `CORS_ORIGINS` set to your Vercel URL
+4. Start it:
 
 ```bash
-cd backend && python -m app.evidence keygen   # prints EVIDENCE_SIGNING_KEY=...
+sudo bash deploy/oracle/setup.sh
+cd deploy/oracle && API_DOMAIN=A-B-C-D.sslip.io docker compose up -d --build
 ```
 
-Add these as Space **secrets**:
-
-- `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, `SUPABASE_JWT_SECRET`, `DATABASE_URL`
-- `EVIDENCE_SIGNING_KEY`
-- `GEMINI_API_KEY` (optional)
-- `PUBLIC_API_URL=https://USER-SPACE.hf.space`
-- `FRONTEND_URL` and `CORS_ORIGINS`, both set to your Vercel URL
-
-The SpeciesNet weights are baked into the image, so cold starts don't download anything. A free Space sleeps after about 48 hours without traffic; the UI shows "Analysis service waking up" until it is back.
+Caddy obtains a Let's Encrypt certificate for the `sslip.io` hostname automatically. The SpeciesNet weights are baked into the image at build time.
 
 ### 3. Web app on Vercel
 
@@ -48,13 +51,13 @@ Import the repository, set the root directory to `crop-raid-guard-ui`, and add:
 
 - `VITE_SUPABASE_URL`
 - `VITE_SUPABASE_PUBLISHABLE_KEY`
-- `VITE_API_URL` (the Space URL)
+- `VITE_API_URL` (the API URL, e.g. `https://A-B-C-D.sslip.io`)
 
 `vercel.json` already sets the build command (`NITRO_PRESET=vercel bun run build`).
 
 ### 4. Keep the free tiers awake
 
-Supabase pauses free projects after a week of inactivity. In the GitHub repository, set the variable `API_URL` (**Settings → Secrets and variables → Actions → Variables**) to the Space URL. `.github/workflows/keepalive.yml` then pings `/healthz` every two days, which touches the database.
+Supabase pauses free projects after a week of inactivity. In the GitHub repository, set the variable `API_URL` (**Settings → Secrets and variables → Actions → Variables**) to the API URL. `.github/workflows/keepalive.yml` then pings `/healthz` every two days, which touches the database.
 
 ## Develop locally
 

@@ -1,0 +1,9 @@
+{$API_DOMAIN} {
+	encode gzip
+	request_body {
+		max_size 60MB
+	}
+	reverse_proxy api:7860 {
+		flush_interval -1
+	}
+}
