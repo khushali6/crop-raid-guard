@@ -235,3 +235,29 @@ def test_template_claim_text_uses_only_known_facts():
     assert "wild boar" in text and "2 animal(s)" in text
     assert "[policy number]" in text and "signed evidence pack are attached" in text
     assert "geotag" not in text.lower()
+
+
+def test_classify_key_frames_limits_classifier_and_propagates_labels():
+    from pathlib import Path
+
+    from app.vision.detector import Detection, FramePrediction
+    from app.vision.media import Frame
+    from app.vision.pipeline import _classify_key_frames
+
+    frames = [Frame(i, float(i), Path(f"f{i}.jpg")) for i in range(40)]
+    preds = {f.index: FramePrediction(f.path, [Detection("animal", 0.5 + (f.index % 5) / 10, (0.1, 0.1, 0.2, 0.2))]
+                                      if 5 <= f.index < 35 else []) for f in frames}
+
+    class Fake:
+        calls: list[Path] = []
+
+        def classify(self, batch, country, admin1):
+            for p in batch:
+                self.calls.append(p.path)
+                p.species_label, p.species_score = "boar", 0.9
+
+    fake = Fake()
+    _classify_key_frames(fake, frames, preds, limit=4)
+    assert len(fake.calls) == 4
+    assert all(preds[i].species_label == "boar" for i in range(5, 35))
+    assert all(preds[i].species_label is None for i in [*range(5), *range(35, 40)])

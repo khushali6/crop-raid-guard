@@ -61,6 +61,31 @@ def _label_key(label: str) -> str | None:
     return mapped.key if mapped else None
 
 
+def _animal_conf(pred: FramePrediction, threshold: float) -> float:
+    return max((d.conf for d in pred.detections if d.label == "animal" and d.conf >= threshold), default=0.0)
+
+
+def _classify_key_frames(backend, selected: list[media.Frame], predictions: dict[int, FramePrediction], limit: int) -> None:
+    """Classify the most confident animal frame from up to `limit` evenly sized time slices,
+    then give every other animal frame the species of its nearest classified neighbour."""
+    s = get_settings()
+    animal = [f for f in selected if _animal_conf(predictions[f.index], s.detection_threshold) > 0]
+    if not animal:
+        return
+    n = min(len(animal), max(limit, 1))
+    picks = [max(animal[i * len(animal) // n : (i + 1) * len(animal) // n],
+                 key=lambda f: _animal_conf(predictions[f.index], s.detection_threshold)) for i in range(n)]
+    backend.classify([predictions[f.index] for f in picks], s.country_code, s.admin1_region)
+    labelled = [f for f in picks if predictions[f.index].species_label]
+    if not labelled:
+        return
+    for f in animal:
+        pred = predictions[f.index]
+        if pred.species_label is None:
+            src = predictions[min(labelled, key=lambda c: abs(c.t - f.t)).index]
+            pred.species_label, pred.species_score = src.species_label, src.species_score
+
+
 def _run_vision(video_path: Path, work: Path, on_batch) -> Analysis:
     s = get_settings()
     meta = media.probe(video_path)
@@ -69,15 +94,16 @@ def _run_vision(video_path: Path, work: Path, on_batch) -> Analysis:
         raise JobError("No frames could be read from this video.")
     media.score_motion(frames)
     selected = media.select_frames(frames, s.motion_threshold, s.keepalive_every_s, s.max_frames)
-    backend = get_backend(s.vision_backend, s.speciesnet_model)
+    backend = get_backend(s.vision_backend, s.speciesnet_model, s.detector_img_size)
 
     predictions: dict[int, FramePrediction] = {}
-    batch = 24
+    batch = 12
     for start in range(0, len(selected), batch):
         chunk = selected[start : start + batch]
-        for fr, pred in zip(chunk, backend.predict([f.path for f in chunk], s.country_code, s.admin1_region), strict=True):
+        for fr, pred in zip(chunk, backend.detect([f.path for f in chunk]), strict=True):
             predictions[fr.index] = pred
         on_batch(min(start + batch, len(selected)), len(selected))
+    _classify_key_frames(backend, selected, predictions, s.max_classify_frames)
 
     tracker = IoUTracker()
     tracked: list[TrackedDetection] = []
@@ -93,15 +119,16 @@ def _run_vision(video_path: Path, work: Path, on_batch) -> Analysis:
                     backend.name, backend.version)
 
 
-async def _history(conn, farm_id: str, species_key: str, started_at) -> tuple[int, int]:
+async def _history(conn, farm_id: str, species_key: str, started_at, video_id: str) -> tuple[int, int]:
     row = await db.fetch_one(
         conn,
         """select
              count(*) filter (where started_at >= %(t)s - interval '7 days' and started_at < %(t)s) as last7,
              count(*) filter (where started_at >= %(t)s - interval '14 days' and started_at < %(t)s - interval '7 days') as prev7
            from public.events
-           where farm_id = %(farm)s and final_species_key = %(sp)s and review_status <> 'rejected'""",
-        {"t": started_at, "farm": farm_id, "sp": species_key},
+           where farm_id = %(farm)s and final_species_key = %(sp)s and review_status <> 'rejected'
+             and video_id <> %(video)s""",
+        {"t": started_at, "farm": farm_id, "sp": species_key, "video": video_id},
     )
     return int(row["last7"]), int(row["prev7"])
 
@@ -143,17 +170,26 @@ async def analyze_video(job: dict[str, Any]) -> None:
 
         await _progress(video_id, 12, "Sampling frames")
         try:
-            analysis = await asyncio.to_thread(_run_vision, src, work, on_batch)
+            meta = await asyncio.to_thread(media.probe, src)
         except media.MediaError as exc:
             raise JobError(f"We could not read this video: {exc}") from exc
+        transcode = None
+        if meta.codec != "h264" or "mp4" not in meta.container:
+            transcode = asyncio.create_task(asyncio.to_thread(media.transcode_web, src, work / "web.mp4"))
+        try:
+            analysis = await asyncio.to_thread(_run_vision, src, work, on_batch)
+        except BaseException as exc:
+            if transcode:
+                transcode.cancel()
+            if isinstance(exc, media.MediaError):
+                raise JobError(f"We could not read this video: {exc}") from exc
+            raise
 
-        meta = analysis.meta
         await _progress(video_id, 74, "Grouping activity")
 
         playback_path = None
-        if meta.codec != "h264" or "mp4" not in meta.container:
-            web = await asyncio.to_thread(media.transcode_web, src, work / "web.mp4")
-            playback_path = await storage.upload("media", f"{org_id}/{video_id}/playback.mp4", web, "video/mp4")
+        if transcode:
+            playback_path = await storage.upload("media", f"{org_id}/{video_id}/playback.mp4", await transcode, "video/mp4")
 
         captured_at = video["captured_at"]
         mismatch = bool(meta.creation_time and abs((meta.creation_time - captured_at).total_seconds()) > 86400)
@@ -170,11 +206,20 @@ async def analyze_video(job: dict[str, Any]) -> None:
             await conn.execute("delete from public.events where video_id = %s", (video_id,))
             await conn.execute("delete from public.alerts where video_id = %s", (video_id,))
 
-        created: list[dict[str, Any]] = []
-        total = max(len(analysis.events), 1)
-        for n, ev in enumerate(analysis.events):
-            await _progress(video_id, 76 + int(18 * n / total), f"Building evidence ({n + 1}/{len(analysis.events)})")
-            created.append(await _store_event(video, ev, analysis, src, work, captured_at))
+        total = len(analysis.events)
+        done = 0
+        gate = asyncio.Semaphore(3)
+
+        async def build(ev: GroupedEvent) -> dict[str, Any]:
+            nonlocal done
+            async with gate:
+                result = await _store_event(video, ev, analysis, src, work, captured_at)
+            done += 1
+            await _progress(video_id, 76 + int(18 * done / max(total, 1)), f"Building evidence ({done}/{total})")
+            return result
+
+        await _progress(video_id, 76, f"Building evidence (0/{total})")
+        created: list[dict[str, Any]] = list(await asyncio.gather(*(build(ev) for ev in analysis.events)))
 
         thumb_frame = None
         if created:
@@ -232,7 +277,10 @@ async def _store_event(video: dict, ev: GroupedEvent, analysis: Analysis, src: P
     duration = max(ev.end_t - ev.start_t, 1.0 / max(s.sample_fps, 0.1))
 
     async with db.service() as conn:
-        visits_7d, visits_prev = await _history(conn, farm_id, key, started_at)
+        visits_7d, visits_prev = await _history(conn, farm_id, key, started_at, video_id)
+    # Events from this video are stored concurrently, so count earlier ones in memory.
+    visits_7d += sum(1 for other in analysis.events
+                     if other.start_t < ev.start_t and ((other.species_label and _label_key(other.species_label)) or "animal") == key)
     risk = compute_risk(RiskInputs(key, video["crop"], local, duration, ev.max_individuals, visits_7d, visits_prev, conf))
 
     async with db.service() as conn:

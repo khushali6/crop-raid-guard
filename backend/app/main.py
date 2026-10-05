@@ -17,6 +17,7 @@ from app.api import router
 from app.config import get_settings
 from app.mcp_server import build_mcp
 from app.rag.ingest import ingest_dir
+from app.vision.detector import get_backend
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("crop-raid-guard")
@@ -38,6 +39,14 @@ async def autoload_kb() -> None:
         log.warning("knowledge base autoload failed: %s", exc)
 
 
+async def warm_vision() -> None:
+    try:
+        await asyncio.to_thread(get_backend(settings.vision_backend, settings.speciesnet_model, settings.detector_img_size).warm)
+        log.info("vision model warm")
+    except Exception as exc:
+        log.warning("vision warmup failed: %s", exc)
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     stop = asyncio.Event()
@@ -50,6 +59,8 @@ async def lifespan(_: FastAPI):
     if state["db"] and settings.worker_enabled:
         worker_task = asyncio.create_task(worker.run_forever(stop))
         state["worker"] = True
+        if settings.vision_warmup:
+            state["warmup"] = asyncio.create_task(warm_vision())
     kb_task = None
     if state["db"] and settings.llm_enabled and settings.kb_autoload and KB_DIR.is_dir():
         kb_task = asyncio.create_task(autoload_kb())

@@ -1,17 +1,21 @@
 """Detection + classification backends.
 
-`SpeciesNetBackend` runs Google's SpeciesNet ensemble (MegaDetector + species classifier +
-geofence) on sampled frames. `MockBackend` produces deterministic output for tests and CI.
+`SpeciesNetBackend` runs Google's SpeciesNet (MegaDetector + species classifier + geofenced
+ensemble) as two stages: the detector on every sampled frame, then the classifier and ensemble
+only on the frames the pipeline picks. `MockBackend` produces deterministic output for tests and CI.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import os
 import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol
 
 log = logging.getLogger(__name__)
 
@@ -29,55 +33,112 @@ class FramePrediction:
     detections: list[Detection] = field(default_factory=list)
     species_label: str | None = None
     species_score: float = 0.0
+    raw: dict[str, Any] | None = field(default=None, repr=False)
 
 
 class VisionBackend(Protocol):
     name: str
     version: str
 
-    def predict(self, frames: list[Path], country: str, admin1: str | None) -> list[FramePrediction]: ...
+    def warm(self) -> None: ...
+
+    def detect(self, frames: list[Path]) -> list[FramePrediction]: ...
+
+    def classify(self, preds: list[FramePrediction], country: str, admin1: str | None) -> None: ...
+
+
+def _detection(d: dict[str, Any]) -> Detection:
+    return Detection(d.get("label", "animal"), float(d.get("conf", 0)), tuple(float(x) for x in d.get("bbox", [0, 0, 0, 0])))
 
 
 class SpeciesNetBackend:
     name = "speciesnet"
     _lock = threading.Lock()
-    _model = None
+    _parts = None
+    _warm = False
 
-    def __init__(self, model_name: str):
+    def __init__(self, model_name: str, detector_size: int = 640, classifier_batch: int = 8):
         self.model_name = model_name
+        self.detector_size = detector_size
+        self.classifier_batch = classifier_batch
         self.version = model_name.rsplit("/", 2)[-2] if "/" in model_name else model_name
 
     def _load(self):
         with self._lock:
-            if SpeciesNetBackend._model is None:
-                from speciesnet import SpeciesNet
+            if SpeciesNetBackend._parts is None:
+                import torch
+                from speciesnet.classifier import SpeciesNetClassifier
+                from speciesnet.detector import SpeciesNetDetector
+                from speciesnet.ensemble import SpeciesNetEnsemble
 
-                log.info("loading SpeciesNet %s", self.model_name)
-                SpeciesNetBackend._model = SpeciesNet(self.model_name, components="all", geofence=True)
-        return SpeciesNetBackend._model
+                torch.set_num_threads(os.cpu_count() or 1)
+                # MegaDetector's letterbox size is a class attribute read on every preprocess.
+                SpeciesNetDetector.IMG_SIZE = self.detector_size
+                started = time.monotonic()
+                SpeciesNetBackend._parts = (
+                    SpeciesNetDetector(self.model_name),
+                    SpeciesNetClassifier(self.model_name),
+                    SpeciesNetEnsemble(self.model_name, geofence=True),
+                )
+                log.info("loaded SpeciesNet %s in %.1fs (detector %dpx, %d threads)", self.model_name,
+                         time.monotonic() - started, self.detector_size, torch.get_num_threads())
+        return SpeciesNetBackend._parts
 
-    def predict(self, frames: list[Path], country: str, admin1: str | None) -> list[FramePrediction]:
+    def warm(self) -> None:
+        """Load weights and run one dummy pass so the first real video doesn't pay for it."""
+        detector, classifier, _ = self._load()
+        if SpeciesNetBackend._warm:
+            return
+        from PIL import Image
+
+        img = Image.new("RGB", (1280, 720), (96, 112, 72))
+        detector.predict("warmup", detector.preprocess(img))
+        classifier.batch_predict(["warmup"], [classifier.preprocess(img)])
+        SpeciesNetBackend._warm = True
+
+    def detect(self, frames: list[Path]) -> list[FramePrediction]:
         if not frames:
             return []
-        model = self._load()
-        result = model.predict(
-            filepaths=[str(p) for p in frames],
-            country=country,
-            admin1_region=admin1,
-            run_mode="multi_thread",
-            batch_size=8,
-            progress_bars=False,
-        ) or {}
-        by_path = {p.get("filepath"): p for p in result.get("predictions", [])}
+        detector, _, _ = self._load()
+        from speciesnet.utils import load_rgb_image
+
         out: list[FramePrediction] = []
-        for path in frames:
-            pred = by_path.get(str(path), {})
-            dets = [
-                Detection(d.get("label", "animal"), float(d.get("conf", 0)), tuple(float(x) for x in d.get("bbox", [0, 0, 0, 0])))
-                for d in pred.get("detections", []) or []
-            ]
-            out.append(FramePrediction(path, dets, pred.get("prediction"), float(pred.get("prediction_score") or 0)))
+        # Decode + letterbox on a side thread while torch uses the cores for inference.
+        with ThreadPoolExecutor(2) as pool:
+            inputs = pool.map(lambda p: detector.preprocess(load_rgb_image(str(p))), frames)
+            for path, img in zip(frames, inputs, strict=True):
+                raw = detector.predict(str(path), img)
+                out.append(FramePrediction(path, [_detection(d) for d in raw.get("detections") or []], raw=raw))
         return out
+
+    def classify(self, preds: list[FramePrediction], country: str, admin1: str | None) -> None:
+        preds = [p for p in preds if p.raw is not None and "failures" not in p.raw]
+        if not preds:
+            return
+        _, classifier, ensemble = self._load()
+        from speciesnet.utils import BBox, load_rgb_image
+
+        def prepare(p: FramePrediction):
+            bboxes = [BBox(*d["bbox"]) for d in p.raw.get("detections") or []]
+            return classifier.preprocess(load_rgb_image(str(p.path)), bboxes=bboxes)
+
+        paths = [str(p.path) for p in preds]
+        with ThreadPoolExecutor(2) as pool:
+            inputs = list(pool.map(prepare, preds))
+        results: dict[str, Any] = {}
+        for i in range(0, len(paths), self.classifier_batch):
+            for r in classifier.batch_predict(paths[i : i + self.classifier_batch], inputs[i : i + self.classifier_batch]):
+                results[r["filepath"]] = r
+        geo = {p: {"country": country, "admin1_region": admin1} for p in paths}
+        combined = ensemble.combine(
+            filepaths=paths,
+            classifier_results=results,
+            detector_results={str(p.path): p.raw for p in preds},
+            geolocation_results=geo,
+            partial_predictions={},
+        )
+        for p, r in zip(preds, combined, strict=True):
+            p.species_label, p.species_score = r.get("prediction"), float(r.get("prediction_score") or 0)
 
 
 class MockBackend:
@@ -86,7 +147,10 @@ class MockBackend:
     name = "mock"
     version = "mock-1"
 
-    def predict(self, frames: list[Path], country: str, admin1: str | None) -> list[FramePrediction]:
+    def warm(self) -> None:
+        return None
+
+    def detect(self, frames: list[Path]) -> list[FramePrediction]:
         out: list[FramePrediction] = []
         boar = "a1;mammalia;cetartiodactyla;suidae;sus;scrofa;wild boar"
         for i, path in enumerate(frames):
@@ -103,8 +167,11 @@ class MockBackend:
                 out.append(FramePrediction(path, [], "b;;;;;;blank", 0.95))
         return out
 
+    def classify(self, preds: list[FramePrediction], country: str, admin1: str | None) -> None:
+        return None
 
-def get_backend(name: str, model_name: str) -> VisionBackend:
+
+def get_backend(name: str, model_name: str, detector_size: int = 640) -> VisionBackend:
     if name == "mock":
         return MockBackend()
-    return SpeciesNetBackend(model_name)
+    return SpeciesNetBackend(model_name, detector_size)
