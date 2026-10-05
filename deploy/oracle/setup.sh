@@ -10,8 +10,9 @@ fi
 
 # Oracle's Ubuntu images ship iptables rules that reject everything except SSH.
 for port in 80 443; do
-  iptables -C INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null \
-    || iptables -I INPUT 6 -p tcp -m state --state NEW --dport "$port" -j ACCEPT
+  while iptables -D INPUT -p tcp -m state --state NEW --dport "$port" -j ACCEPT 2>/dev/null; do :; done
+  reject=$(iptables -L INPUT --line-numbers -n | awk '$2 == "REJECT" {print $1; exit}')
+  iptables -I INPUT "${reject:-1}" -p tcp -m state --state NEW --dport "$port" -j ACCEPT
 done
 if command -v netfilter-persistent >/dev/null; then netfilter-persistent save; fi
 
